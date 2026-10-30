@@ -1,0 +1,37 @@
+name: EDEN020MOD
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        ref: 0.2.0-ok
+
+    - name: Setup Java
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: 17
+
+    - name: Install dependencies
+      run: |
+        sudo apt update
+        sudo apt install -y ninja-build cmake glslang-tools ccache
+
+    - name: Build Mainline Release APK
+      run: |
+        cd src/android
+        chmod +x gradlew
+        ./gradlew :app:assembleMainlineRelease --no-daemon
+
+    - name: Upload APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: EDEN020
+        path: "**/*.apk"
