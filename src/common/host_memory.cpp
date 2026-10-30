@@ -418,12 +418,16 @@ static void* ChooseVirtualBase(size_t virtual_size) {
     constexpr uintptr_t Map39BitSize = (1ULL << 39);
     constexpr uintptr_t Map36BitSize = (1ULL << 36);
 
+    // This is not a cryptographic application, we just want something random.
     std::mt19937_64 rng;
 
+    // We want to ensure we are allocating at an address aligned to the L2 block size.
+    // For Qualcomm devices, we must also allocate memory above 36 bits.
     const size_t lower = Map36BitSize / HugePageSize;
     const size_t upper = (Map39BitSize - virtual_size) / HugePageSize;
     const size_t range = upper - lower;
 
+    // 1. Setup the file path in the app's private cache
     const char* tmpdir = std::getenv("TMPDIR");
     std::string filepath = "";
     if (tmpdir != nullptr) {
@@ -442,8 +446,12 @@ static void* ChooseVirtualBase(size_t virtual_size) {
         }
     }
 
+    // Try up to 64 times to allocate memory at random addresses in the range.
     for (int i = 0; i < 64; i++) {
+        // Calculate a possible location.
         uintptr_t hint_address = ((rng() % range) + lower) * HugePageSize;
+
+        // Try to map.
         void* map_pointer = MAP_FAILED;
         
         if (fd != -1) {
@@ -456,19 +464,21 @@ static void* ChooseVirtualBase(size_t virtual_size) {
                                MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_NOCORE, -1, 0);
         }
 
+        // If we successfully mapped, we're done.
         if (reinterpret_cast<uintptr_t>(map_pointer) == hint_address) {
             if (fd != -1) close(fd); 
             
-            // Set the Hot limit to 7 GB (Proven safe in tests)
+            // 2. THE 3-LAYER TRICK
+            // 7GB Hot (RAM + Swap) - Proven safe by the 7GB Hot / 5GB Cold Test
             size_t hot_size = 7ULL * 1024 * 1024 * 1024; 
-            size_t cold_size = virtual_size - hot_size; 
+            size_t cold_size = virtual_size - hot_size;  // 5GB Cold (Storage File)
 
             if (virtual_size > hot_size) {
                 madvise(map_pointer, hot_size, MADV_WILLNEED);
                 madvise(static_cast<char*>(map_pointer) + hot_size, cold_size, MADV_DONTNEED);
             }
 
-            // Dynamically commit the Hot memory to prevent the LMK from panicking
+            // DYNAMIC COMMIT to prevent the LMK from panicking
             LOG_INFO(HW_Memory, "Dynamically committing 7GB of Hot memory...");
             volatile char* force_commit = static_cast<char*>(map_pointer);
             for (size_t i = 0; i < hot_size; i += 4096) {
@@ -479,6 +489,7 @@ static void* ChooseVirtualBase(size_t virtual_size) {
             return map_pointer;
         }
 
+        // Unmap if necessary, and try again.
         if (map_pointer != MAP_FAILED) {
             munmap(map_pointer, virtual_size);
         }
@@ -714,12 +725,13 @@ private:
             ASSERT_MSG(ret == 0, "close failed: {}", strerror(errno));
         }
 
-        // Clean up the 12GB file on exit
+        // --- ADD THIS BLOCK TO CLEAN UP THE 12GB FILE ---
         const char* tmpdir = std::getenv("TMPDIR");
         if (tmpdir != nullptr) {
             std::string filepath = std::string(tmpdir) + "/eden_12gb_swap.bin";
             unlink(filepath.c_str());
         }
+        // ------------------------------------------------
     }
 
     void AdjustMap(size_t* virtual_offset, size_t* length) {
@@ -759,40 +771,4 @@ HostMemory::HostMemory(size_t backing_size_, size_t virtual_size_)
     virtual_base = nullptr;
 #else
     // Try to allocate a fastmem arena.
-    impl = std::make_unique<HostMemory::Impl>(AlignUp(backing_size, PageAlignment), AlignUp(virtual_size, PageAlignment) + HugePageSize);
-    if (impl->Init()) {
-        backing_base = impl->backing_base;
-        virtual_base = impl->virtual_base;
-        if (virtual_base) {
-            // Ensure the virtual base is aligned to the L2 block size.
-            virtual_base = reinterpret_cast<u8*>(Common::AlignUp(uintptr_t(virtual_base), HugePageSize));
-            virtual_base_offset = virtual_base - impl->virtual_base;
-        }
-    } else {
-        LOG_WARNING(HW_Memory, "Platform can support fastmem, but can't create it");
-        fallback_buffer = true;
-        backing_base = static_cast<u8*>(impl->Allocate(backing_size));
-        virtual_base = nullptr;
-        impl.reset();
-    }
-#endif
-}
-
-HostMemory::~HostMemory() {
-#ifdef _WIN32
-    if (fallback_buffer) {
-        VirtualFree(backing_base, backing_size, MEM_RELEASE);
-    }
-#else
-    if (fallback_buffer) {
-        munmap(backing_base, backing_size);
-    }
-#endif
-}
-
-HostMemory::HostMemory(HostMemory&&) noexcept = default;
-
-HostMemory& HostMemory::operator=(HostMemory&&) noexcept = default;
-
-void HostMemory::Map(size_t virtual_offset, size_t host_offset, size_t length, MemoryPermission perms, bool separate_heap) {
-#if !(defined(__OPENORBIS__) || defined
+    impl = std::make_unique<HostMemory::Impl>(AlignUp(backing_size, PageAlignment),
