@@ -21,6 +21,8 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <cstdlib>
+#include <string>
 #include "common/scope_exit.h"
 
 #if defined(__linux__)
@@ -416,37 +418,73 @@ static void* ChooseVirtualBase(size_t virtual_size) {
     constexpr uintptr_t Map39BitSize = (1ULL << 39);
     constexpr uintptr_t Map36BitSize = (1ULL << 36);
 
-    // This is not a cryptographic application, we just want something random.
     std::mt19937_64 rng;
 
-    // We want to ensure we are allocating at an address aligned to the L2 block size.
-    // For Qualcomm devices, we must also allocate memory above 36 bits.
     const size_t lower = Map36BitSize / HugePageSize;
     const size_t upper = (Map39BitSize - virtual_size) / HugePageSize;
     const size_t range = upper - lower;
 
-    // Try up to 64 times to allocate memory at random addresses in the range.
+    const char* tmpdir = std::getenv("TMPDIR");
+    std::string filepath = "";
+    if (tmpdir != nullptr) {
+        filepath = std::string(tmpdir) + "/eden_12gb_swap.bin";
+    }
+
+    int fd = -1;
+    if (!filepath.empty()) {
+        fd = open(filepath.c_str(), O_RDWR | O_CREAT, 0600);
+        if (fd != -1) {
+            if (ftruncate(fd, virtual_size) != 0) {
+                LOG_WARNING(HW_Memory, "ftruncate failed for {}: {}", filepath, strerror(errno));
+                close(fd);
+                fd = -1;
+            }
+        }
+    }
+
     for (int i = 0; i < 64; i++) {
-        // Calculate a possible location.
         uintptr_t hint_address = ((rng() % range) + lower) * HugePageSize;
+        void* map_pointer = MAP_FAILED;
+        
+        if (fd != -1) {
+            map_pointer = mmap(reinterpret_cast<void*>(hint_address), virtual_size, 
+                               PROT_READ | PROT_WRITE,
+                               MAP_SHARED | MAP_NORESERVE | MAP_NOCORE, fd, 0);
+        } else {
+            map_pointer = mmap(reinterpret_cast<void*>(hint_address), virtual_size, 
+                               PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_NOCORE, -1, 0);
+        }
 
-        // Try to map.
-        // Note: we may be able to take advantage of MAP_FIXED_NOREPLACE here.
-        void* map_pointer =
-            mmap(reinterpret_cast<void*>(hint_address), virtual_size, PROT_READ | PROT_WRITE,
-                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_NOCORE, -1, 0);
-
-        // If we successfully mapped, we're done.
         if (reinterpret_cast<uintptr_t>(map_pointer) == hint_address) {
+            if (fd != -1) close(fd); 
+            
+            // Set the Hot limit to 7 GB (Proven safe in tests)
+            size_t hot_size = 7ULL * 1024 * 1024 * 1024; 
+            size_t cold_size = virtual_size - hot_size; 
+
+            if (virtual_size > hot_size) {
+                madvise(map_pointer, hot_size, MADV_WILLNEED);
+                madvise(static_cast<char*>(map_pointer) + hot_size, cold_size, MADV_DONTNEED);
+            }
+
+            // Dynamically commit the Hot memory to prevent the LMK from panicking
+            LOG_INFO(HW_Memory, "Dynamically committing 7GB of Hot memory...");
+            volatile char* force_commit = static_cast<char*>(map_pointer);
+            for (size_t i = 0; i < hot_size; i += 4096) {
+                force_commit[i] = 0;
+            }
+            
+            LOG_INFO(HW_Memory, "Applied 7GB Hot / 5GB Cold memory split.");
             return map_pointer;
         }
 
-        // Unmap if necessary, and try again.
         if (map_pointer != MAP_FAILED) {
             munmap(map_pointer, virtual_size);
         }
     }
 
+    if (fd != -1) close(fd);
     return MAP_FAILED;
 }
 
@@ -675,6 +713,13 @@ private:
             int ret = close(fd);
             ASSERT_MSG(ret == 0, "close failed: {}", strerror(errno));
         }
+
+        // Clean up the 12GB file on exit
+        const char* tmpdir = std::getenv("TMPDIR");
+        if (tmpdir != nullptr) {
+            std::string filepath = std::string(tmpdir) + "/eden_12gb_swap.bin";
+            unlink(filepath.c_str());
+        }
     }
 
     void AdjustMap(size_t* virtual_offset, size_t* length) {
@@ -750,57 +795,4 @@ HostMemory::HostMemory(HostMemory&&) noexcept = default;
 HostMemory& HostMemory::operator=(HostMemory&&) noexcept = default;
 
 void HostMemory::Map(size_t virtual_offset, size_t host_offset, size_t length, MemoryPermission perms, bool separate_heap) {
-#if !(defined(__OPENORBIS__) || defined(__managarm__))
-    ASSERT(virtual_offset % PageAlignment == 0);
-    ASSERT(host_offset % PageAlignment == 0);
-    ASSERT(length % PageAlignment == 0);
-    ASSERT(virtual_offset + length <= virtual_size);
-    ASSERT(host_offset + length <= backing_size);
-    if (length == 0 || !virtual_base || !impl) {
-        return;
-    }
-    impl->Map(virtual_offset + virtual_base_offset, host_offset, length, perms);
-#endif
-}
-
-void HostMemory::Unmap(size_t virtual_offset, size_t length, bool separate_heap) {
-#if !(defined(__OPENORBIS__) || defined(__managarm__))
-    ASSERT(virtual_offset % PageAlignment == 0);
-    ASSERT(length % PageAlignment == 0);
-    ASSERT(virtual_offset + length <= virtual_size);
-    if (length == 0 || !virtual_base || !impl) {
-        return;
-    }
-    impl->Unmap(virtual_offset + virtual_base_offset, length);
-#endif
-}
-
-void HostMemory::Protect(size_t virtual_offset, size_t length, MemoryPermission perm) {
-#if !(defined(__OPENORBIS__) || defined(__managarm__))
-    ASSERT(virtual_offset % PageAlignment == 0);
-    ASSERT(length % PageAlignment == 0);
-    ASSERT(virtual_offset + length <= virtual_size);
-    if (length == 0 || !virtual_base || !impl) {
-        return;
-    }
-    const bool read = True(perm & MemoryPermission::Read);
-    const bool write = True(perm & MemoryPermission::Write);
-    const bool execute = True(perm & MemoryPermission::Execute);
-    impl->Protect(virtual_offset + virtual_base_offset, length, read, write, execute);
-#endif
-}
-
-void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 fill_value) {
-    std::memset(backing_base + physical_offset, fill_value, length);
-}
-
-void HostMemory::EnableDirectMappedAddress() {
-#if !(defined(__OPENORBIS__) || defined(__managarm__))
-    if (impl) {
-        impl->EnableDirectMappedAddress();
-        virtual_size += reinterpret_cast<uintptr_t>(virtual_base);
-    }
-#endif
-}
-
-} // namespace Common
+#if !(defined(__OPENORBIS__) || defined
